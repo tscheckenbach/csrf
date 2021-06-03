@@ -131,6 +131,16 @@ func TrustedOrigins(origins []string) Option {
 	}
 }
 
+// TrustedTokens configures a set of tokens that are considered as trusted.
+// This will allow static tokens to be valid - e.g. for POSTMAN
+//
+// You should only provide static tokens if there is no other way.
+func TrustedTokens(tokens []string) Option {
+	return func(cs *csrf) {
+		cs.opts.TrustedTokens = tokens
+	}
+}
+
 // setStore sets the store used by the CSRF middleware.
 // Note: this is private (for now) to allow for internal API changes.
 func setStore(s store) Option {

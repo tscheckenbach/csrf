@@ -1,13 +1,12 @@
 package csrf
 
 import (
+	"encoding/base64"
 	"fmt"
+	"github.com/gorilla/securecookie"
+	"github.com/pkg/errors"
 	"net/http"
 	"net/url"
-
-	"github.com/pkg/errors"
-
-	"github.com/gorilla/securecookie"
 )
 
 // CSRF token length in bytes.
@@ -94,6 +93,7 @@ type options struct {
 	ErrorHandler   http.Handler
 	CookieName     string
 	TrustedOrigins []string
+	TrustedTokens  []string
 }
 
 // Protect is HTTP middleware that provides Cross-Site Request Forgery
@@ -284,6 +284,22 @@ func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		// Retrieve the combined token (pad + masked) token and unmask it.
 		requestToken := unmask(cs.requestToken(r))
+
+		// if the request token is a trusted one we don't check against the real token
+		if len(cs.opts.TrustedTokens) > 0 {
+			for _, trustedToken := range cs.opts.TrustedTokens {
+				// Decode the "issued" (pad + masked) token sent in the request. Return a
+				// nil byte slice on a decoding error (this will fail upstream).
+				decoded, err := base64.StdEncoding.DecodeString(trustedToken)
+				if err != nil {
+					continue
+				}
+
+				if len(unmask(decoded)) == len(requestToken) {
+					return
+				}
+			}
+		}
 
 		// Compare the request token against the real token
 		if !compareTokens(requestToken, realToken) {
