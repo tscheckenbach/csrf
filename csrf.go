@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"github.com/gorilla/securecookie"
+	"github.com/gin-gonic/gin"
 	"github.com/pkg/errors"
 	"net/http"
 	"net/url"
@@ -71,8 +72,7 @@ const (
 	SameSiteNoneMode
 )
 
-type csrf struct {
-	h    http.Handler
+type Csrf struct {
 	sc   *securecookie.SecureCookie
 	st   store
 	opts options
@@ -145,178 +145,181 @@ type options struct {
 //		// framework.
 //	}
 //
-func Protect(authKey []byte, opts ...Option) func(http.Handler) http.Handler {
-	return func(h http.Handler) http.Handler {
-		cs := parseOptions(h, opts...)
+func New(authKey []byte, opts ...Option) *Csrf {
+		csr := parseOptions(opts...)
 
 		// Set the defaults if no options have been specified
-		if cs.opts.ErrorHandler == nil {
-			cs.opts.ErrorHandler = http.HandlerFunc(unauthorizedHandler)
+		if csr.opts.ErrorHandler == nil {
+			csr.opts.ErrorHandler = http.HandlerFunc(unauthorizedHandler)
 		}
 
-		if cs.opts.MaxAge < 0 {
+		if csr.opts.MaxAge < 0 {
 			// Default of 12 hours
-			cs.opts.MaxAge = defaultAge
+			csr.opts.MaxAge = defaultAge
 		}
 
-		if cs.opts.FieldName == "" {
-			cs.opts.FieldName = fieldName
+		if csr.opts.FieldName == "" {
+			csr.opts.FieldName = fieldName
 		}
 
-		if cs.opts.CookieName == "" {
-			cs.opts.CookieName = cookieName
+		if csr.opts.CookieName == "" {
+			csr.opts.CookieName = cookieName
 		}
 
-		if cs.opts.RequestHeader == "" {
-			cs.opts.RequestHeader = headerName
+		if csr.opts.RequestHeader == "" {
+			csr.opts.RequestHeader = headerName
 		}
 
 		// Create an authenticated securecookie instance.
-		if cs.sc == nil {
-			cs.sc = securecookie.New(authKey, nil)
+		if csr.sc == nil {
+			csr.sc = securecookie.New(authKey, nil)
 			// Use JSON serialization (faster than one-off gob encoding)
-			cs.sc.SetSerializer(securecookie.JSONEncoder{})
+			csr.sc.SetSerializer(securecookie.JSONEncoder{})
 			// Set the MaxAge of the underlying securecookie.
-			cs.sc.MaxAge(cs.opts.MaxAge)
+			csr.sc.MaxAge(csr.opts.MaxAge)
 		}
 
-		if cs.st == nil {
+		if csr.st == nil {
 			// Default to the cookieStore
-			cs.st = &cookieStore{
-				name:     cs.opts.CookieName,
-				maxAge:   cs.opts.MaxAge,
-				secure:   cs.opts.Secure,
-				httpOnly: cs.opts.HttpOnly,
-				sameSite: cs.opts.SameSite,
-				path:     cs.opts.Path,
-				domain:   cs.opts.Domain,
-				sc:       cs.sc,
+			csr.st = &cookieStore{
+				name:     csr.opts.CookieName,
+				maxAge:   csr.opts.MaxAge,
+				secure:   csr.opts.Secure,
+				httpOnly: csr.opts.HttpOnly,
+				sameSite: csr.opts.SameSite,
+				path:     csr.opts.Path,
+				domain:   csr.opts.Domain,
+				sc:       csr.sc,
 			}
 		}
-
-		return cs
-	}
+		
+		return csr
 }
 
 // Implements http.Handler for the csrf type.
-func (cs *csrf) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Skip the check if directed to. This should always be a bool.
-	if val, err := contextGet(r, skipCheckKey); err == nil {
-		if skip, ok := val.(bool); ok {
-			if skip {
-				cs.h.ServeHTTP(w, r)
-				return
-			}
-		}
-	}
+func (csr *Csrf) Protect() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		r := c.Request
+		w := c.Writer
 
-	// Retrieve the token from the session.
-	// An error represents either a cookie that failed HMAC validation
-	// or that doesn't exist.
-	realToken, err := cs.st.Get(r)
-	if err != nil || len(realToken) != tokenLength {
-		// If there was an error retrieving the token, the token doesn't exist
-		// yet, or it's the wrong length, generate a new token.
-		// Note that the new token will (correctly) fail validation downstream
-		// as it will no longer match the request token.
-		realToken, err = generateRandomBytes(tokenLength)
-		if err != nil {
-			r = envError(r, err)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
-			return
-		}
-
-		// Save the new (real) token in the session store.
-		err = cs.st.Save(realToken, w)
-		if err != nil {
-			r = envError(r, err)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
-			return
-		}
-	}
-
-	// Save the masked token to the request context
-	r = contextSave(r, tokenKey, mask(realToken, r))
-	// Save the field name to the request context
-	r = contextSave(r, formKey, cs.opts.FieldName)
-
-	// HTTP methods not defined as idempotent ("safe") under RFC7231 require
-	// inspection.
-	if !contains(safeMethods, r.Method) {
-		// Enforce an origin check for HTTPS connections. As per the Django CSRF
-		// implementation (https://goo.gl/vKA7GE) the Referer header is almost
-		// always present for same-domain HTTP requests.
-		if r.URL.Scheme == "https" {
-			// Fetch the Referer value. Call the error handler if it's empty or
-			// otherwise fails to parse.
-			referer, err := url.Parse(r.Referer())
-			if err != nil || referer.String() == "" {
-				r = envError(r, ErrNoReferer)
-				cs.opts.ErrorHandler.ServeHTTP(w, r)
-				return
-			}
-
-			valid := sameOrigin(r.URL, referer)
-
-			if !valid {
-				for _, trustedOrigin := range cs.opts.TrustedOrigins {
-					if referer.Host == trustedOrigin {
-						valid = true
-						break
-					}
-				}
-			}
-
-			if valid == false {
-				r = envError(r, ErrBadReferer)
-				cs.opts.ErrorHandler.ServeHTTP(w, r)
-				return
-			}
-		}
-
-		// If the token returned from the session store is nil for non-idempotent
-		// ("unsafe") methods, call the error handler.
-		if realToken == nil {
-			r = envError(r, ErrNoToken)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
-			return
-		}
-
-		// Retrieve the combined token (pad + masked) token and unmask it.
-		requestToken := unmask(cs.requestToken(r))
-
-		// if the request token is a trusted one we don't check against the real token
-		if len(cs.opts.TrustedTokens) > 0 {
-			for _, trustedToken := range cs.opts.TrustedTokens {
-				// Decode the "issued" (pad + masked) token sent in the request. Return a
-				// nil byte slice on a decoding error (this will fail upstream).
-				decoded, err := base64.StdEncoding.DecodeString(trustedToken)
-				if err != nil {
-					continue
-				}
-
-				if len(unmask(decoded)) == len(requestToken) {
+		// Skip the check if directed to. This should always be a bool.
+		if val, err := contextGet(r, skipCheckKey); err == nil {
+			if skip, ok := val.(bool); ok {
+				if skip {
+					c.Next()
 					return
 				}
 			}
 		}
 
-		// Compare the request token against the real token
-		if !compareTokens(requestToken, realToken) {
-			r = envError(r, ErrBadToken)
-			cs.opts.ErrorHandler.ServeHTTP(w, r)
-			return
+		// Retrieve the token from the session.
+		// An error represents either a cookie that failed HMAC validation
+		// or that doesn't exist.
+		realToken, err := csr.st.Get(r)
+		if err != nil || len(realToken) != tokenLength {
+			// If there was an error retrieving the token, the token doesn't exist
+			// yet, or it's the wrong length, generate a new token.
+			// Note that the new token will (correctly) fail validation downstream
+			// as it will no longer match the request token.
+			realToken, err = generateRandomBytes(tokenLength)
+			if err != nil {
+				r = envError(r, err)
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
+
+			// Save the new (real) token in the session store.
+			err = csr.st.Save(realToken, w)
+			if err != nil {
+				r = envError(r, err)
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
 		}
 
+		// Save the masked token to the request context
+		c.Set(tokenKey, mask(realToken, r))
+		// Save the field name to the request context
+		c.Set(formKey, csr.opts.FieldName)
+
+		// HTTP methods not defined as idempotent ("safe") under RFC7231 require
+		// inspection.
+		if !contains(safeMethods, r.Method) {
+			// Enforce an origin check for HTTPS connections. As per the Django CSRF
+			// implementation (https://goo.gl/vKA7GE) the Referer header is almost
+			// always present for same-domain HTTP requests.
+			if r.URL.Scheme == "https" {
+				// Fetch the Referer value. Call the error handler if it's empty or
+				// otherwise fails to parse.
+				referer, err := url.Parse(r.Referer())
+				if err != nil || referer.String() == "" {
+					r = envError(r, ErrNoReferer)
+					csr.opts.ErrorHandler.ServeHTTP(w, r)
+					return
+				}
+
+				valid := sameOrigin(r.URL, referer)
+
+				if !valid {
+					for _, trustedOrigin := range csr.opts.TrustedOrigins {
+						if referer.Host == trustedOrigin {
+							valid = true
+							break
+						}
+					}
+				}
+
+				if valid == false {
+					r = envError(r, ErrBadReferer)
+					c.AbortWithStatus(http.StatusForbidden)
+					return
+				}
+			}
+
+			// If the token returned from the session store is nil for non-idempotent
+			// ("unsafe") methods, call the error handler.
+			if realToken == nil {
+				r = envError(r, ErrNoToken)
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
+
+			// Retrieve the combined token (pad + masked) token and unmask it.
+			requestToken := unmask(csr.requestToken(r))
+
+			// if the request token is a trusted one we don't check against the real token
+			if len(csr.opts.TrustedTokens) > 0 {
+				for _, trustedToken := range csr.opts.TrustedTokens {
+					// Decode the "issued" (pad + masked) token sent in the request. Return a
+					// nil byte slice on a decoding error (this will fail upstream).
+					decoded, err := base64.StdEncoding.DecodeString(trustedToken)
+					if err != nil {
+						continue
+					}
+
+					if len(unmask(decoded)) == len(requestToken) {
+						return
+					}
+				}
+			}
+
+			// Compare the request token against the real token
+			if !compareTokens(requestToken, realToken) {
+				r = envError(r, ErrBadToken)
+				c.AbortWithStatus(http.StatusForbidden)
+				return
+			}
+
+		}
+
+		// Set the Vary: Cookie header to protect clients from caching the response.
+		w.Header().Add("Vary", "Cookie")
+
+		// Clear the request context after the handler has completed.
+		//contextClear(r)
+		
+		c.Next()
 	}
-
-	// Set the Vary: Cookie header to protect clients from caching the response.
-	w.Header().Add("Vary", "Cookie")
-
-	// Call the wrapped handler/router on success.
-	cs.h.ServeHTTP(w, r)
-	// Clear the request context after the handler has completed.
-	contextClear(r)
 }
 
 // unauthorizedhandler sets a HTTP 403 Forbidden status and writes the
@@ -326,4 +329,8 @@ func unauthorizedHandler(w http.ResponseWriter, r *http.Request) {
 		http.StatusText(http.StatusForbidden), FailureReason(r)),
 		http.StatusForbidden)
 	return
+}
+
+func GetTokenKey() string {
+	return tokenKey
 }
